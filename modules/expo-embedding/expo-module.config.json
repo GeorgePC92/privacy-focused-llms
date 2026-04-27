@@ -1,0 +1,12 @@
+{
+    "name": "expo-embedding",
+    "platforms": [
+        "ios"
+    ],
+    "ios": {
+        "modules": [
+            "EmbeddingModule"
+        ],
+        "podspecPath": "ios/ExpoEmbedding.podspec"
+    }
+}

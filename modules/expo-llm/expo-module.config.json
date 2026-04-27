@@ -1,0 +1,11 @@
+{
+    "name": "expo-llm",
+    "platforms": [
+        "ios"
+    ],
+    "ios": {
+        "modules": [
+            "ExpoLLMModule"
+        ]
+    }
+}

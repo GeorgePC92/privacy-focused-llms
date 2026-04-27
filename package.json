@@ -1,0 +1,35 @@
+{
+  "name": "solid-fl-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo run:ios",
+    "android": "expo run:android",
+    "web": "expo start --web"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "^1.24.0",
+    "expo": "~54.0.31",
+    "expo-auth-session": "~7.0.10",
+    "expo-crypto": "~15.0.8",
+    "expo-embedding": "file:modules/expo-embedding",
+    "expo-file-system": "~19.0.21",
+    "expo-image-manipulator": "~14.0.8",
+    "expo-image-picker": "~17.0.10",
+    "expo-llm": "file:modules/expo-llm",
+    "expo-media-library": "~18.2.1",
+    "expo-random": "~13.6.0",
+    "expo-web-browser": "~15.0.10",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-executorch": "^0.6.0",
+    "react-native-safe-area-context": "~5.6.0",
+    "react-native-screens": "~4.16.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.10",
+    "typescript": "~5.9.2"
+  }
+}

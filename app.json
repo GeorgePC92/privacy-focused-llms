@@ -1,0 +1,16 @@
+{
+    "expo": {
+        "name": "solidfl",
+        "slug": "solidfl",
+        "scheme": "com.anonymous.solidfl",
+        "plugins": [
+            "expo-web-browser"
+        ],
+        "android": {
+            "package": "com.anonymous.solidfl"
+        },
+        "ios": {
+            "bundleIdentifier": "com.anonymous.solidfl"
+        }
+    }
+}
