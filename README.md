@@ -103,19 +103,6 @@ It is intended as a **proof-of-concept**, not a production system.
 
 ---
 
-## Code Release
-
-🚧 **Coming soon** 🚧  
-The full source code, including:
-- mobile application,
-- on-device LLM integration,
-- image classification pipeline,
-- Solid Pod interaction logic,
-
-will be released shortly after final review and documentation.
-
----
-
 ## 📽 Demo
 
 A short video demonstration of the system is included in the repository root:
