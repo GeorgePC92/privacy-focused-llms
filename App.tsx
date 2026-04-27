@@ -1,12 +1,13 @@
 // App.tsx
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import {
     Button,
     SafeAreaView,
     ScrollView,
     Text,
-    TextInput,
     View,
+    Switch,
+    TextInput,
     Alert,
 } from "react-native";
 
@@ -18,10 +19,12 @@ import * as MediaLibrary from "expo-media-library";
 import * as ImageManipulator from "expo-image-manipulator";
 
 import { useLLM, type Message } from "react-native-executorch";
-import { flowerDetector } from "./src/flowerDetector";
 
-import { putBlob, putText, putFile } from "./src/solid";
-import { LLMAction, UploadAction } from "./src/llmAction";
+import { LABELS, NUM_LABELS } from "./src/labels";
+import { addSample, loadSamples, clearSamples } from "./src/storage";
+import { initHead, predictProbs, trainStep, flattenHead, diffFlat } from "./src/head";
+import { putNpy, putText, putBlob } from "./src/solid";
+import { LLMAction } from "./src/llmAction";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -30,9 +33,10 @@ const AUTH_ENDPOINT = "https://pods.solidcommunity.au/.oidc/auth";
 const TOKEN_ENDPOINT = "https://pods.solidcommunity.au/.oidc/token";
 const REG_ENDPOINT = "https://pods.solidcommunity.au/.oidc/reg";
 
-
-// Solid upload target
-const POD_BASE = "https://pods.solidcommunity.au/TestPod1/"; // keep trailing slash
+// Solid upload target (ensure trailing slash)
+const POD_BASE = "https://pods.solidcommunity.au/TestPod1/";
+const JOB_ID = "flair_job_1";
+const CLIENT_TAG = "mobile_1";
 
 // ===== helpers =====
 function now() {
@@ -41,13 +45,6 @@ function now() {
 function sleep(ms: number) {
     return new Promise((r) => setTimeout(r, ms));
 }
-
-function canonicalAssetId(id: string) {
-    // iOS sometimes gives "UUID/L0/001" from localUri-style strings
-    // Expo MediaLibrary Asset.id is usually just the UUID
-    return (id || "").split("/")[0].trim();
-}
-
 function base64UrlFromBytes(bytes: Uint8Array) {
     let s = "";
     for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
@@ -73,44 +70,90 @@ function parseQueryParams(url: string): Record<string, string> {
     }
     return out;
 }
-
-
-function diagnoseNetworkError(e: any, ctx: {
-    step: string;
-    url?: string;
-    token?: string;
-    blob?: Blob | null;
-    uri?: string;
-}) {
-    const tokenLen = ctx.token ? ctx.token.length : 0;
-
-    const hints: string[] = [];
-    if (ctx.url && /\/shared\/.*\/L\d+\/\d+/.test(ctx.url)) {
-        hints.push("URL contains '/L0/001' style segments -> likely unsanitized asset id in filename");
+async function fetchWithDebug(
+    addLog: (s: string) => void,
+    url: string,
+    init?: RequestInit,
+    timeoutMs = 20000
+) {
+    const method = init?.method ?? "GET";
+    addLog(`[${now()}] fetch ${method} ${url}`);
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { ...init, signal: ctrl.signal });
+        addLog(`[${now()}] -> ${res.status} ${res.statusText}`);
+        return res;
+    } catch (e: any) {
+        addLog(`[${now()}] !!! fetch error: ${e?.message ?? String(e)}`);
+        throw e;
+    } finally {
+        clearTimeout(t);
     }
-    if (ctx.url && ctx.url.includes(" ")) hints.push("URL contains spaces -> must encode/sanitize filename");
-    if (ctx.url && !ctx.url.startsWith("https://")) hints.push("URL is not https://");
-    if (!ctx.token) hints.push("No access token set");
-    if (ctx.token && tokenLen < 20) hints.push(`Token looks too short (len=${tokenLen})`);
-    if (ctx.blob && typeof (ctx.blob as any).size === "number" && (ctx.blob as any).size === 0) {
-        hints.push("Blob size is 0 -> image read/convert failed");
-    }
-    if (ctx.uri && ctx.uri.startsWith("ph://")) {
-        hints.push("URI is ph:// (iOS Photos) -> sometimes fetch(uri).blob() fails; prefer FileSystem.uploadAsync");
-    }
-
-    const extra = [
-        `step=${ctx.step}`,
-        ctx.url ? `url=${ctx.url}` : "",
-        ctx.uri ? `uri=${ctx.uri}` : "",
-        `token.len=${tokenLen}`,
-        ctx.blob ? `blob.type=${(ctx.blob as any).type || "?"} blob.size=${(ctx.blob as any).size ?? "?"}` : "blob=(none)",
-        `err.name=${e?.name ?? "(none)"}`,
-        `err.message=${e?.message ?? "(none)"}`,
-    ].filter(Boolean).join(" | ");
-
-    return { extra, hints };
 }
+async function dynamicRegister(addLog: (s: string) => void, redirectUri: string): Promise<string> {
+    const body = {
+        client_name: "SolidFL Mobile (Expo Dev Build)",
+        application_type: "native",
+        redirect_uris: [redirectUri],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+    };
+
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= 6; attempt++) {
+        try {
+            addLog(`[${now()}] reg attempt ${attempt}/6`);
+            const res = await fetchWithDebug(addLog, REG_ENDPOINT, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Accept: "application/json" },
+                body: JSON.stringify(body),
+            });
+            const txt = await res.text().catch(() => "");
+            if (!res.ok) throw new Error(`client reg failed: ${res.status} ${res.statusText}\n${txt}`);
+            const j = JSON.parse(txt);
+            if (!j.client_id) throw new Error("client reg response missing client_id");
+            return j.client_id as string;
+        } catch (e: any) {
+            lastErr = e;
+            const backoff = 600 * attempt + Math.floor(Math.random() * 300);
+            addLog(`[${now()}] reg failed: ${e?.message ?? String(e)}`);
+            addLog(`[${now()}] retrying in ${backoff}ms...`);
+            await sleep(backoff);
+        }
+    }
+    throw lastErr ?? new Error("dynamic register failed");
+}
+async function exchangeToken(
+    addLog: (s: string) => void,
+    params: { code: string; codeVerifier: string; clientId: string; redirectUri: string }
+) {
+    const body = new URLSearchParams();
+    body.set("grant_type", "authorization_code");
+    body.set("code", params.code);
+    body.set("redirect_uri", params.redirectUri);
+    body.set("client_id", params.clientId);
+    body.set("code_verifier", params.codeVerifier);
+
+    const res = await fetchWithDebug(addLog, TOKEN_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        body: body.toString(),
+    });
+
+    const txt = await res.text().catch(() => "");
+    if (!res.ok) throw new Error(`token exchange failed: ${res.status} ${res.statusText}\n${txt}`);
+    return JSON.parse(txt) as { access_token: string; token_type: string; expires_in?: number };
+}
+
+function topK(probs: Float32Array, k = 5) {
+    const idx = [...probs.keys()];
+    idx.sort((a, b) => probs[b] - probs[a]);
+    return idx.slice(0, k).map((i) => ({ i, label: LABELS[i], p: probs[i] }));
+}
+
+//	ppppp
 
 function toErrString(e: unknown) {
     if (e == null) return "(none)";
@@ -124,6 +167,14 @@ function toErrString(e: unknown) {
         return String(e);
     }
 }
+
+// ===== LLM model assets (BUNDLED) =====
+const LOCAL_LLM_MODEL = {
+    modelSource: require("./local-llm/fine-tuning/fine_tuned_qwen3_06b.pte"),
+    tokenizerSource: require("./local-llm/fine-tuning/tokenizer.tok"),
+    tokenizerConfigSource: require("./local-llm/fine-tuning/tokenizer_config.tokcfg"),
+};
+
 function extractFirstJsonObject(text: string) {
     const start = text.indexOf("{");
     if (start === -1) return null;
@@ -141,183 +192,128 @@ function extractFirstJsonObject(text: string) {
             else if (c === '"') inStr = false;
             continue;
         } else {
-            if (c === '"') { inStr = true; continue; }
+            if (c === '"') {
+                inStr = true;
+                continue;
+            }
             if (c === "{") depth++;
             if (c === "}") depth--;
             if (depth === 0) {
                 const candidate = text.slice(start, i + 1).trim();
-                try { return JSON.parse(candidate); } catch { return null; }
-            }
-        }
-    }
-    return null;
-}
-
-function extractJsonArrayAnywhere(text: string): string[] | null {
-    const start = text.indexOf("[");
-    if (start === -1) return null;
-
-    let depth = 0;
-    let inStr = false;
-    let esc = false;
-
-    for (let i = start; i < text.length; i++) {
-        const c = text[i];
-
-        if (inStr) {
-            if (esc) esc = false;
-            else if (c === "\\") esc = true;
-            else if (c === '"') inStr = false;
-            continue;
-        } else {
-            if (c === '"') { inStr = true; continue; }
-            if (c === "[") depth++;
-            if (c === "]") depth--;
-
-            if (depth === 0) {
-                const candidate = text.slice(start, i + 1).trim();
                 try {
-                    const parsed = JSON.parse(candidate);
-                    if (!Array.isArray(parsed)) return null;
-
-                    // normalize to string[]
-                    const out = parsed
-                        .filter((x) => typeof x === "string")
-                        .map((x) => x.trim())
-                        .filter((x) => x.length > 0);
-
-                    return out.length ? out : [];
+                    return JSON.parse(candidate);
                 } catch {
                     return null;
                 }
             }
         }
     }
-
     return null;
 }
 
-// IMPORTANT: sanitize anything that ends up in a URL path segment
-function safeIdForFilename(id: string) {
-    // turns "CC95.../L0/001" into "CC95..._L0_001"
-    return id.replace(/[^a-zA-Z0-9._-]/g, "_");
+function LLMRunner(props: {
+    instruction: string;
+    onLog: (s: string) => void;
+    onAssistantText: (s: string) => void;
+    onAction: (a: LLMAction) => void;
+}) {
+    const { instruction, onLog, onAssistantText, onAction } = props;
+
+    const llm = useLLM({ model: LOCAL_LLM_MODEL });
+
+    const ask = useCallback(async () => {
+        const log = (s: string) => onLog(`[${now()}] ${s}`);
+
+        if (llm.error) return log(`❌ LLM error: ${toErrString(llm.error)}`);
+        if (!llm.isReady) return log(`⏳ LLM loading...`);
+
+        const system =
+            "Return ONLY a JSON object.\n" +
+            "No other text.\n" +
+            "Keys: query, filters, require_confirm, upload_path.\n" +
+            "Keep it compact.\n";
+
+        const messages: Message[] = [
+            { role: "system", content: system },
+            { role: "user", content: instruction },
+        ];
+
+        log(`generate start`);
+        try {
+            // @ts-ignore
+            await llm.generate(messages);
+        } catch (e) {
+            log(`❌ generate threw: ${toErrString(e)}`);
+            return;
+        }
+
+        const raw = llm.response ?? "";
+        onAssistantText(raw);
+        log(`done chars=${raw.length}`);
+
+        const obj = extractFirstJsonObject(raw);
+        if (!obj) {
+            log(`❌ JSON missing/truncated. Raw:\n${raw}`);
+            return;
+        }
+
+        onAction(obj as LLMAction);
+        log(`✅ parsed action ok`);
+    }, [instruction, llm, onAction, onAssistantText, onLog]);
+
+    return (
+        <View style={{ gap: 6 }}>
+            <Text style={{ fontSize: 12, color: "gray" }}>
+                LLM: ready={String(llm.isReady)} | generating={String(llm.isGenerating)} | progress=
+                {String(llm.downloadProgress)} | error={llm.error ? toErrString(llm.error) : "(none)"}
+            </Text>
+            <Button title="Ask LLM → produce action" onPress={ask} />
+        </View>
+    );
 }
 
-// ===== LLM model assets (BUNDLED) =====
-const LOCAL_LLM_MODEL = {
-    modelSource: require("./local-llm/fine-tuning/fine_tuned_qwen3_06b.pte"),
-    tokenizerSource: require("./local-llm/fine-tuning/tokenizer.tok"),
-    tokenizerConfigSource: require("./local-llm/fine-tuning/tokenizer_config.tokcfg"),
-};
-
-type FlowerCandidate = {
-    assetId: string;
-    uri: string; // original local uri for upload
-    suggestedName: string;
-};
-
-
-
+// ===== App =====
 export default function App() {
     const [log, setLog] = useState("");
+    const [accessToken, setAccessToken] = useState("");
+    const [clientId, setClientId] = useState("");
+
+    // Tiny head demo state
+    const [embedDim, setEmbedDim] = useState<number | null>(null);
+    const [head, setHead] = useState<any>(null);
+    const [globalFlat, setGlobalFlat] = useState<Float32Array | null>(null);
+    const [lastEmbedding, setLastEmbedding] = useState<Float32Array | null>(null);
+    const [predTop, setPredTop] = useState<{ i: number; label: string; p: number }[]>([]);
+    const [labelState, setLabelState] = useState<boolean[]>(Array(NUM_LABELS).fill(false));
+
+    // LLM state
+    const [instruction, setInstruction] = useState(
+        "Upload photos from today. Don't upload pictures of children, nudity or PII. Downsized only. Strip metadata."
+    );
+    const [assistantText, setAssistantText] = useState("");
+    const [pendingAction, setPendingAction] = useState<LLMAction | null>(null);
+    const [llmMounted, setLlmMounted] = useState(false);
+
+    // Flower scanner state
+    const [scanBusy, setScanBusy] = useState(false);
+    const [maxToScan, setMaxToScan] = useState("50");
+    const [maxToUpload, setMaxToUpload] = useState("10");
+    const [DEV_TREAT_ALL_AS_FLOWERS, setDevTreatAllAsFlowers] = useState(true);
+
     const addLog = useCallback((line: string) => {
         setLog((p) => (p ? p + "\n" : "") + line);
     }, []);
     const clear = useCallback(() => setLog(""), []);
 
-    const [accessToken, setAccessToken] = useState("");
-    const [clientId, setClientId] = useState("");
-
-    const [instruction, setInstruction] = useState(
-        "Upload pictures of flowers from my recent camera roll."
-    );
-
-    const [scanSummary, setScanSummary] = useState<string>("");
-    const [candidates, setCandidates] = useState<FlowerCandidate[]>([]);
-
-    const [assistantText, setAssistantText] = useState("");
-    const [pendingAction, setPendingAction] = useState<UploadAction | null>(null);
-
-    const [busy, setBusy] = useState(false);
-    const lastUploadKeyRef = useRef<string>("");
-
     const redirectUri = useMemo(() => {
         return AuthSession.makeRedirectUri({ scheme: "com.anonymous.solidfl", path: "auth" });
     }, []);
 
-    // ---- auth helpers ----
-    async function fetchWithDebug(url: string, init?: RequestInit, timeoutMs = 20000) {
-        const method = init?.method ?? "GET";
-        addLog(`[${now()}] fetch ${method} ${url}`);
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), timeoutMs);
-        try {
-            const res = await fetch(url, { ...init, signal: ctrl.signal });
-            addLog(`[${now()}] -> ${res.status} ${res.statusText}`);
-            return res;
-        } finally {
-            clearTimeout(t);
-        }
-    }
-
-    async function dynamicRegister(redirectUriStr: string): Promise<string> {
-        const body = {
-            client_name: "SolidFL Mobile (Expo Dev Build)",
-            application_type: "native",
-            redirect_uris: [redirectUriStr],
-            token_endpoint_auth_method: "none",
-            grant_types: ["authorization_code", "refresh_token"],
-            response_types: ["code"],
-        };
-
-        let lastErr: any = null;
-        for (let attempt = 1; attempt <= 6; attempt++) {
-            try {
-                addLog(`[${now()}] reg attempt ${attempt}/6`);
-                const res = await fetchWithDebug(REG_ENDPOINT, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", Accept: "application/json" },
-                    body: JSON.stringify(body),
-                });
-                const txt = await res.text().catch(() => "");
-                if (!res.ok) throw new Error(`client reg failed: ${res.status} ${res.statusText}\n${txt}`);
-                const j = JSON.parse(txt);
-                if (!j.client_id) throw new Error("client reg response missing client_id");
-                return j.client_id as string;
-            } catch (e: any) {
-                lastErr = e;
-                const backoff = 600 * attempt + Math.floor(Math.random() * 300);
-                addLog(`[${now()}] reg failed: ${e?.message ?? String(e)}`);
-                addLog(`[${now()}] retrying in ${backoff}ms...`);
-                await sleep(backoff);
-            }
-        }
-        throw lastErr ?? new Error("dynamic register failed");
-    }
-
-    async function exchangeToken(params: {
-        code: string;
-        codeVerifier: string;
-        clientId: string;
-        redirectUri: string;
-    }) {
-        const body = new URLSearchParams();
-        body.set("grant_type", "authorization_code");
-        body.set("code", params.code);
-        body.set("redirect_uri", params.redirectUri);
-        body.set("client_id", params.clientId);
-        body.set("code_verifier", params.codeVerifier);
-
-        const res = await fetchWithDebug(TOKEN_ENDPOINT, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-            body: body.toString(),
-        });
-
-        const txt = await res.text().catch(() => "");
-        if (!res.ok) throw new Error(`token exchange failed: ${res.status} ${res.statusText}\n${txt}`);
-        return JSON.parse(txt) as { access_token: string; token_type: string; expires_in?: number };
-    }
+    const initLLM = useCallback(() => {
+        clear();
+        addLog(`[${now()}] init LLM requested (mounting LLMRunner)...`);
+        setLlmMounted(true);
+    }, [addLog, clear]);
 
     const login = useCallback(async () => {
         clear();
@@ -326,7 +322,6 @@ export default function App() {
         try {
             addLog(`[${now()}] redirectUri: ${redirectUri}`);
 
-            // PKCE
             let codeVerifier = "";
             for (let tries = 0; tries < 5; tries++) {
                 const bytes = await Crypto.getRandomBytesAsync(64);
@@ -335,7 +330,7 @@ export default function App() {
             }
             const codeChallenge = await sha256Base64Url(codeVerifier);
 
-            const newClientId = await dynamicRegister(redirectUri);
+            const newClientId = await dynamicRegister(addLog, redirectUri);
             setClientId(newClientId);
             addLog(`[${now()}] client_id: ${newClientId}`);
 
@@ -360,7 +355,7 @@ export default function App() {
             const code = qp.code;
             if (!code) throw new Error(`missing code in redirect: ${result.url}`);
 
-            const tok = await exchangeToken({
+            const tok = await exchangeToken(addLog, {
                 code,
                 codeVerifier,
                 clientId: newClientId,
@@ -374,445 +369,205 @@ export default function App() {
         }
     }, [addLog, clear, redirectUri]);
 
-    // ---- scan (no upload) ----
-    const scanCameraRollForFlowers = useCallback(async () => {
-        addLog(`[${now()}] 📷 requesting media library permission...`);
-        const perm = await MediaLibrary.requestPermissionsAsync();
-        if (!perm.granted) {
-            addLog(`[${now()}] ❌ media library permission denied`);
-            return { summary: "no permission", hits: [] as FlowerCandidate[] };
+    // --------- NO-UI flower scan + upload ----------
+    const scanAndUploadFlowers = useCallback(async () => {
+        if (!accessToken) {
+            Alert.alert("Not logged in", "Login first so we can upload to your Pod.");
+            return;
         }
+        if (scanBusy) return;
 
-        const maxToScan = 80;
-        addLog(`[${now()}] listing recent images (max ${maxToScan})...`);
+        const scanN = Math.max(1, Math.min(500, parseInt(maxToScan || "50", 10) || 50));
+        const uploadN = Math.max(1, Math.min(200, parseInt(maxToUpload || "10", 10) || 10));
 
-        // Use the enum-safe form to avoid sort bugs:
-        const page = await MediaLibrary.getAssetsAsync({
-            mediaType: MediaLibrary.MediaType.photo,
-            sortBy: [MediaLibrary.SortBy.creationTime],
-            first: maxToScan,
-        });
-
-        addLog(`[${now()}] found ${page.assets.length} assets`);
-
-        // Warmup on first available image (optional but helps)
-        if (page.assets[0]) {
-            try {
-                const info0 = await MediaLibrary.getAssetInfoAsync(page.assets[0]);
-                const uri0 = info0.localUri ?? info0.uri;
-                if (uri0) {
-                    const warm = await ImageManipulator.manipulateAsync(
-                        uri0,
-                        [{ resize: { width: 224 } }],
-                        { compress: 0.85, format: ImageManipulator.SaveFormat.JPEG }
-                    );
-                    addLog(`[${now()}] warming up flowerDetector...`);
-                    await flowerDetector.warmup(warm.uri);
-                    addLog(`[${now()}] ✅ warmup done`);
-                }
-            } catch (e) {
-                addLog(`[${now()}] ⚠️ warmup failed (continuing): ${toErrString(e)}`);
-            }
-        }
-
-        const hits: FlowerCandidate[] = [];
-
-        for (let idx = 0; idx < page.assets.length; idx++) {
-            const a = page.assets[idx];
-
-            let uri: string | null = null;
-            try {
-                const info = await MediaLibrary.getAssetInfoAsync(a);
-                uri = info.localUri ?? info.uri ?? null;
-            } catch (e) {
-                addLog(`[${now()}] ⚠️ getAssetInfo failed idx=${idx}: ${toErrString(e)}`);
-                continue;
-            }
-            if (!uri) continue;
-
-            try {
-                const preview = await ImageManipulator.manipulateAsync(
-                    uri,
-                    [{ resize: { width: 224 } }],
-                    { compress: 0.85, format: ImageManipulator.SaveFormat.JPEG }
-                );
-
-                addLog(`[${now()}] 🔎 classify ${idx + 1}/${page.assets.length}...`);
-                const isFlower = await flowerDetector.isFlowerImage(preview.uri);
-                if (!isFlower) continue;
-
-                const safe = safeIdForFilename(a.id);
-                hits.push({
-                    assetId: canonicalAssetId(a.id),
-                    uri,
-                    suggestedName: `flower_${Date.now()}_${safe}.jpg`,
-                });
-
-                const canonId = canonicalAssetId(a.id);
-                addLog(`[${now()}] 🌸 hit: raw=${a.id} canon=${canonId}`);
-                if (hits.length >= 20) break; // keep prompt small
-            } catch (e) {
-                addLog(`[${now()}] ⚠️ classify failed id=${a.id}: ${toErrString(e)}`);
-            }
-        }
-
-        const summary =
-            `Found ${hits.length} flower candidates.\n` +
-            hits.slice(0, 12).map((h, i) => `${i + 1}. id=${canonicalAssetId(h.assetId)}`).join("\n");
-
-        setCandidates(hits);
-        setScanSummary(summary);
-        addLog(`[${now()}] ✅ scanSummary ready for LLM:\n${summary}`);
-
-        return { summary, hits };
-    }, [addLog]);
-
-
-
-    // ---- LLM ----
-    const llm = useLLM({ model: LOCAL_LLM_MODEL });
-
-    // Decide confirmation in code (do NOT ask model)
-    function wantsImmediateUpload(text: string) {
-        const t = (text || "").toLowerCase();
-        return (
-            t.includes("upload directly") ||
-            t.includes("upload now") ||
-            t.includes("upload immediately") ||
-            t.includes("upload right now") ||
-            (t.includes("upload") && t.includes("direct"))
-        );
-    }
-    function extractBetween(text: string, a: string, b: string) {
-        const i = text.indexOf(a);
-        if (i === -1) return null;
-        const j = text.indexOf(b, i + a.length);
-        if (j === -1) return null;
-        return text.slice(i + a.length, j).trim();
-    }
-
-    function parseJsonArrayBetweenMarkers(raw: string) {
-        const inner = extractBetween(raw, "<<<JSON>>>", "<<<END_JSON>>>");
-        if (!inner) return null;
+        setScanBusy(true);
         try {
-            const v = JSON.parse(inner);
-            return Array.isArray(v) ? v : null;
-        } catch {
-            return null;
-        }
-    }
-    // Keep scan->LLM payload tiny: IDs only
-    function extractIdsFromScan(scanText: string) {
-        // supports: "id=XYZ", "id = XYZ", "id: XYZ"
-        const ids = Array.from(
-            scanText.matchAll(/\bid\s*[:=]\s*([^\s]+)/gi)
-        ).map((m) => canonicalAssetId(m[1]));
-
-        return Array.from(new Set(ids));
-    }
-
-    // Find a JSON array anywhere in the output (more robust than object-only)
-    function extractFirstJsonArray(text: string) {
-        const start = text.indexOf("[");
-        if (start === -1) return null;
-
-        let depth = 0;
-        let inStr = false;
-        let esc = false;
-
-        for (let i = start; i < text.length; i++) {
-            const c = text[i];
-
-            if (inStr) {
-                if (esc) esc = false;
-                else if (c === "\\") esc = true;
-                else if (c === '"') inStr = false;
-                continue;
-            } else {
-                if (c === '"') { inStr = true; continue; }
-                if (c === "[") depth++;
-                if (c === "]") depth--;
-                if (depth === 0) {
-                    const candidate = text.slice(start, i + 1).trim();
-                    try { return JSON.parse(candidate); } catch { return null; }
-                }
+            addLog(`[${now()}] 📷 requesting media library permission...`);
+            const perm = await MediaLibrary.requestPermissionsAsync();
+            if (!perm.granted) {
+                addLog(`[${now()}] ❌ media library permission denied`);
+                return;
             }
-        }
-        return null;
-    }
 
-    // Ultra-short system prompt helps small LLMs comply
-    const SYSTEM_IDS_ONLY =
-        'Output ONLY a JSON array of strings. Example: ["id1","id2"]. No other text.';
-
-    // Even stricter retry prompt
-    const SYSTEM_IDS_ONLY_RETRY =
-        'OUTPUT ONLY JSON ARRAY. First char "[" last char "]". No other characters.';
-
-
-    const runLLM = useCallback(async (scanText: string) => {
-        if (llm.error) throw new Error(`LLM error: ${toErrString(llm.error)}`);
-        if (!llm.isReady) throw new Error("LLM not ready yet");
-        if (llm.isGenerating) throw new Error("LLM is already generating");
-
-        const ids = extractIdsFromScan(scanText).slice(0, 20);
-        if (ids.length === 0) {
-            addLog(`[${now()}] ⚠️ No IDs extracted from scanSummary`);
-            return { selected_asset_ids: [] as string[] };
-        }
-
-        // (Optional) if there's only 1 candidate, skip LLM entirely
-        if (ids.length === 1) {
-            addLog(`[${now()}] ✅ Only 1 candidate -> auto-selecting without LLM`);
-            return { selected_asset_ids: [ids[0]] };
-        }
-
-        // 1st attempt
-        llm.configure({
-            chatConfig: {
-                systemPrompt: SYSTEM_IDS_ONLY,
-                initialMessageHistory: [],
-                contextWindowLength: 768,
-            },
-            generationConfig: {
-                temperature: 0.0,
-                topp: 0.9,
-            },
-        });
-
-        const clippedInstr = instruction.trim().slice(0, 180);
-        const userPrompt =
-            `Instruction:\n${clippedInstr}\n\n` +
-            `Choose which of the following IDs should be uploaded:\n` +
-            ids.map((id) => `- ${id}`).join("\n") +
-            `\nReturn ONLY a JSON array of IDs.`;
-
-        addLog(`[${now()}] LLM sendMessage start...`);
-        await llm.sendMessage(userPrompt);
-
-        const raw1 = (llm.response ?? "").trim();
-        setAssistantText(raw1);
-        addLog(`[${now()}] LLM raw tail:\n${raw1.slice(-300)}`);
-
-        let arr = extractJsonArrayAnywhere(raw1);
-
-        // retry
-        if (!arr) {
-            addLog(`[${now()}] ⚠️ LLM did not return JSON array; retrying...`);
-
-            llm.configure({
-                chatConfig: {
-                    systemPrompt: SYSTEM_IDS_ONLY_RETRY,
-                    initialMessageHistory: [],
-                    contextWindowLength: 512,
-                },
-                generationConfig: { temperature: 0.0, topp: 0.9 },
+            addLog(`[${now()}] listing recent images (max ${scanN})...`);
+            const page = await MediaLibrary.getAssetsAsync({
+                mediaType: "photo",
+                sortBy: [["creationTime", false]],
+                first: scanN,
             });
 
-            // HARD anchor to '[' ... ']'
-            const retryPrompt =
-                `Return ONLY a JSON array of chosen IDs.\n` +
-                `Allowed IDs:\n${ids.map((x) => `- ${x}`).join("\n")}\n\n` +
-                `Output:\n[`;
+            addLog(`[${now()}] found ${page.assets.length} assets`);
+            let uploaded = 0;
 
-            await llm.sendMessage(retryPrompt);
+            for (let idx = 0; idx < page.assets.length; idx++) {
+                if (uploaded >= uploadN) break;
 
-            const raw2 = (llm.response ?? "").trim();
-            setAssistantText(raw2);
-            addLog(`[${now()}] LLM retry tail:\n${raw2.slice(-300)}`);
+                const a = page.assets[idx];
+                const info = await MediaLibrary.getAssetInfoAsync(a);
+                const uri = info.localUri ?? info.uri;
+                if (!uri) continue;
 
-            arr = extractJsonArrayAnywhere(raw2);
-            if (!arr) throw new Error(`Could not parse JSON array from LLM after retry:\n${raw2}`);
+                // Downsize (fast path) – later feed this into your on-device flower detector
+                const small = await ImageManipulator.manipulateAsync(
+                    uri,
+                    [{ resize: { width: 640 } }],
+                    { compress: 0.75, format: ImageManipulator.SaveFormat.JPEG }
+                );
+
+                // TODO: replace with real detector:
+                const isFlower = DEV_TREAT_ALL_AS_FLOWERS ? true : false;
+                if (!isFlower) continue;
+
+                // Upload sanitized JPEG (re-encode -> strips metadata in practice)
+                const uploadJpg = await ImageManipulator.manipulateAsync(
+                    uri,
+                    [{ resize: { width: 1024 } }],
+                    { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
+                );
+
+                const blob = await (await fetch(uploadJpg.uri)).blob();
+                const filename = `flower_${Date.now()}_${a.id}.jpg`;
+                const uploadUrl = `${POD_BASE}shared/${filename}`;
+
+                addLog(`[${now()}] 🌸 uploading ${filename} -> shared/`);
+                await putBlob(uploadUrl, accessToken, blob, "image/jpeg");
+
+                uploaded++;
+                addLog(`[${now()}] ✅ uploaded (${uploaded}/${uploadN})`);
+            }
+
+            addLog(`[${now()}] done. uploaded=${uploaded}`);
+            if (uploaded === 0) {
+                addLog(
+                    `[${now()}] (no uploads) — if you haven’t wired a detector yet, keep DEV_TREAT_ALL_AS_FLOWERS=true`
+                );
+            }
+        } catch (e) {
+            addLog(`[${now()}] ❌ scan/upload failed: ${toErrString(e)}`);
+        } finally {
+            setScanBusy(false);
+        }
+    }, [DEV_TREAT_ALL_AS_FLOWERS, accessToken, addLog, maxToScan, maxToUpload, scanBusy]);
+
+    // ------- your existing tiny-head stuff (unchanged) -------
+    const toggleLabel = useCallback((i: number) => {
+        setLabelState((prev) => {
+            const next = [...prev];
+            next[i] = !next[i];
+            return next;
+        });
+    }, []);
+
+    const confirmLabel = useCallback(async () => {
+        if (!lastEmbedding) {
+            addLog(`[${now()}] ❌ no embedding yet (pick an image first)`);
+            return;
+        }
+        const y = labelState.map((v) => (v ? 1 : 0));
+        await addSample({ z: Array.from(lastEmbedding), y, t: Date.now() });
+        addLog(`[${now()}] ✅ saved sample (embedding+labels) locally`);
+    }, [addLog, labelState, lastEmbedding]);
+
+    const trainLocal = useCallback(async () => {
+        if (!head) {
+            addLog(`[${now()}] ❌ head not initialized (pick an image first)`);
+            return;
+        }
+        const samples = await loadSamples();
+        if (samples.length === 0) {
+            addLog(`[${now()}] ❌ no samples yet`);
+            return;
         }
 
-        // clamp to allowed IDs
-        const allowed = new Set(ids);
-        const selected_asset_ids = arr.filter((x) => allowed.has(x));
+        const batchZ: Float32Array[] = [];
+        const batchY: Float32Array[] = [];
+        for (const s of samples) {
+            batchZ.push(new Float32Array(s.z));
+            batchY.push(new Float32Array(s.y));
+        }
 
-        return { selected_asset_ids };
-    }, [addLog, instruction, llm]);
+        addLog(`[${now()}] training head on ${samples.length} samples...`);
+        for (let e = 0; e < 5; e++) trainStep(head, batchZ, batchY, 0.05);
 
-    // ---- upload chosen assets ----
-    const uploadFromAction = useCallback(async (action: UploadAction, candidatesNow: FlowerCandidate[]) => {
+        if (lastEmbedding) {
+            const probs = predictProbs(head, lastEmbedding);
+            setPredTop(topK(probs, 5));
+        }
+        setHead({ ...head });
+        addLog(`[${now()}] ✅ local training done`);
+    }, [addLog, head, lastEmbedding]);
+
+    const uploadDelta = useCallback(async () => {
         if (!accessToken) {
             addLog(`[${now()}] ❌ not logged in`);
             return;
         }
-
-        const ids = (action?.selected_asset_ids ?? []) as string[];
-        const uploadPath = "shared/";
-
-        if (!Array.isArray(ids) || ids.length === 0) {
-            addLog(`[${now()}] (LLM selected no assets to upload)`);
-            return;
-        }
-        if (uploadPath !== "shared/") {
-            addLog(`[${now()}] ❌ refusing upload: upload_path must be 'shared/'`);
+        if (!head || !globalFlat) {
+            addLog(`[${now()}] ❌ head/global not initialized`);
             return;
         }
 
-        const wanted = new Set((action.selected_asset_ids ?? []).map(canonicalAssetId));
-        const selected = candidatesNow.filter((c) => wanted.has(canonicalAssetId(c.assetId)));
-        if (selected.length === 0) {
-            addLog(`[${now()}] ❌ none of selected_asset_ids matched current scan results`);
+        const curFlat = flattenHead(head);
+        const delta = diffFlat(curFlat, globalFlat);
+
+        const url = `${POD_BASE}fl/${JOB_ID}/uploads/round_0/client_${CLIENT_TAG}.npy`;
+        addLog(`[${now()}] uploading delta npy -> ${url}`);
+        await putNpy(url, accessToken, delta);
+        addLog(`[${now()}] ✅ uploaded delta`);
+        setGlobalFlat(curFlat);
+    }, [accessToken, addLog, globalFlat, head]);
+
+    const resetLocal = useCallback(async () => {
+        await clearSamples();
+        setLastEmbedding(null);
+        setPredTop([]);
+        setLabelState(Array(NUM_LABELS).fill(false));
+        addLog(`[${now()}] cleared local samples`);
+    }, [addLog]);
+
+    const confirmAndUploadManifest = useCallback(async () => {
+        if (!accessToken) {
+            Alert.alert("Not logged in", "Login first so we can upload to your Pod.");
+            return;
+        }
+        if (!pendingAction) {
+            Alert.alert("No action", "Ask the LLM first to generate an action.");
             return;
         }
 
-        addLog(`[${now()}] 🚀 uploading ${selected.length} image(s) to /shared/ ...`);
-        for (const c of selected) {
-            const uploadJpg = await ImageManipulator.manipulateAsync(
-                c.uri,
-                [{ resize: { width: 1024 } }],
-                { compress: 0.85, format: ImageManipulator.SaveFormat.JPEG }
-            );
+        const manifest = {
+            created_at: new Date().toISOString(),
+            instruction,
+            action: pendingAction,
+        };
 
-            const uploadUrl = `${POD_BASE}shared/${c.suggestedName}`;
-
-            try {
-                addLog(
-                    `[${now()}] PUT(file) ${uploadUrl} (jpgUri=${uploadJpg.uri})`
-                );
-
-                await putFile(uploadUrl, accessToken, uploadJpg.uri, "image/jpeg");
-
-                addLog(`[${now()}] ✅ PUT ok ${c.suggestedName}`);
-            } catch (e: any) {
-                const d = diagnoseNetworkError(e, {
-                    step: "putFile",
-                    url: uploadUrl,
-                    token: accessToken,
-                    blob: null,
-                    uri: uploadJpg.uri,
-                });
-
-                addLog(`[${now()}] ❌ upload failed: ${d.extra}`);
-                if (d.hints.length) addLog(`[${now()}] 🔎 hints: ${d.hints.join(" | ")}`);
-                throw e;
-            }
-        }
-    }, [accessToken, addLog, candidates]);
-
-    // ---- One button: scan -> LLM -> maybe auto-upload ----
-    const askLLMAndMaybeUpload = useCallback(async () => {
-        if (busy) return;
-        setBusy(true);
-        clear();
-        lastUploadKeyRef.current = ""; // ✅ allow upload every button press
-
-        try {
-
-            // 1) scan first (no upload)
-
-            // 2) LLM decides action
-            // 2) LLM returns IDs only; we build the full action in code
-            const { summary, hits } = await scanCameraRollForFlowers();
-            const idsResult = await runLLM(summary);
-
-            const action: UploadAction = {
-                query: instruction,
-                filters: {},
-                require_confirm: false,
-                upload_path: "shared/",
-                selected_asset_ids: idsResult.selected_asset_ids,
-            };
-
-            // pass hits directly (fresh), not state
-            await uploadFromAction(action, hits);
-
-            const uploadNow = true; // you want no confirmation ever
-
-
-            setPendingAction(action);
-            // 3) manifest upload (optional)
-            try {
-                const manifestUrl = `${POD_BASE}fl/llm_manifest_${Date.now()}.json`;
-                await putText(manifestUrl, accessToken, JSON.stringify({
-                    created_at: new Date().toISOString(),
-                    instruction,
-                    scanSummary: summary,
-                    action,
-                }, null, 2), "application/json");
-                addLog(`[${now()}] ✅ manifest uploaded`);
-            } catch (e) {
-                addLog(`[${now()}] ⚠️ manifest upload failed (continuing): ${toErrString(e)}`);
-            }
-
-            // 4) If require_confirm=false, auto-upload exactly once per action
-            const key = JSON.stringify({
-                ids: action?.selected_asset_ids ?? [],
-                path: action?.upload_path ?? "shared/",
-                confirm: action?.require_confirm ?? true,
-            });
-
-            if (action?.require_confirm === false) {
-                if (lastUploadKeyRef.current === key) {
-                    addLog(`[${now()}] (skipping: already uploaded for this exact action key)`);
-                } else {
-                    try {
-                        lastUploadKeyRef.current = key; // ✅ only set after success
-                        setPendingAction(action);
-                    } catch (e) {
-                        addLog(`[${now()}] ⚠️ upload failed; not marking as uploaded`);
-                        throw e;
-                    }
-                }
-            } else {
-                addLog(`[${now()}] (LLM requires confirm; not auto-uploading)`);
-                Alert.alert("Confirm required", "LLM decided this needs confirmation (require_confirm=true).");
-            }
-        } catch (e: any) {
-            addLog(`❌ generate threw (String): ${String(e)}`);
-            addLog(`❌ typeof: ${typeof e}`);
-            addLog(`❌ message: ${e?.message ?? "(none)"}`);
-            addLog(`❌ name: ${e?.name ?? "(none)"}`);
-            addLog(`❌ stack: ${e?.stack ?? "(none)"}`);
-
-            try {
-                addLog(`❌ ownProps: ${Object.getOwnPropertyNames(e).join(", ")}`);
-                for (const k of Object.getOwnPropertyNames(e)) {
-                    // @ts-ignore
-                    addLog(`   - ${k}: ${String(e[k])}`);
-                }
-            } catch { }
-
-            // Sometimes useful:
-            try { addLog(`❌ keys: ${Object.keys(e).join(", ")}`); } catch { }
-
-            return "";
-        } finally {
-            setBusy(false);
-        }
-    }, [
-        accessToken,
-        addLog,
-        busy,
-        clear,
-        instruction,
-        runLLM,
-        scanCameraRollForFlowers,
-        uploadFromAction,
-    ]);
+        const url = `${POD_BASE}fl/${JOB_ID}/uploads/llm_manifest_${Date.now()}.json`;
+        addLog(`[${now()}] uploading manifest -> ${url}`);
+        await putText(url, accessToken, JSON.stringify(manifest, null, 2), "application/json");
+        addLog(`[${now()}] ✅ manifest uploaded`);
+    }, [accessToken, addLog, instruction, pendingAction]);
 
     return (
         <SafeAreaView style={{ flex: 1 }}>
             <ScrollView contentContainerStyle={{ padding: 16, gap: 10 }}>
                 <Text style={{ fontSize: 20, fontWeight: "600" }}>
-                    SolidFL Mobile (LLM decides flower uploads)
+                    SolidFL Mobile (Tiny Head + on-device LLM via ExecuTorch)
                 </Text>
 
                 <Button title="Login (Solid OIDC)" onPress={login} />
 
-                <Text style={{ fontSize: 12, color: "gray" }}>
-                    token={accessToken ? "✅" : "❌"} | client_id: {clientId || "(none)"}
-                </Text>
-
                 <View style={{ height: 8 }} />
+                <Text style={{ fontSize: 16, fontWeight: "600" }}>LLM Upload Planner</Text>
 
-                <Text style={{ fontSize: 16, fontWeight: "600" }}>User instruction</Text>
+                <Button
+                    title={llmMounted ? "LLM Initialized ✅" : "Init LLM (load bundled .pte + tokenizer)"}
+                    onPress={initLLM}
+                />
+
                 <TextInput
                     value={instruction}
                     onChangeText={setInstruction}
-                    placeholder="e.g. upload flowers directly"
+                    placeholder="e.g. Upload photos from today but not kids, nudity, screenshots, plates"
                     style={{
                         borderWidth: 1,
                         borderRadius: 8,
@@ -822,29 +577,28 @@ export default function App() {
                     multiline
                 />
 
-                <Text style={{ fontSize: 12, color: "gray" }}>
-                    LLM ready={String(llm.isReady)} | generating={String(llm.isGenerating)} | progress=
-                    {String(llm.downloadProgress)} | error={llm.error ? toErrString(llm.error) : "(none)"}
-                </Text>
+                {llmMounted ? (
+                    <LLMRunner
+                        instruction={instruction}
+                        onLog={addLog}
+                        onAssistantText={setAssistantText}
+                        onAction={(a) => setPendingAction(a)}
+                    />
+                ) : (
+                    <Text style={{ fontSize: 12, color: "gray" }}>
+                        Tap “Init LLM” to load the on-device model.
+                    </Text>
+                )}
 
                 <Button
-                    title={busy ? "Working… (scan → LLM → maybe upload)" : "Ask LLM (may auto-upload)"}
-                    onPress={askLLMAndMaybeUpload}
-                    disabled={!accessToken || busy}
+                    title="Confirm & Upload manifest to Solid"
+                    onPress={confirmAndUploadManifest}
+                    disabled={!accessToken || !pendingAction}
                 />
-
-                {scanSummary ? (
-                    <View style={{ marginTop: 8 }}>
-                        <Text style={{ fontSize: 14, fontWeight: "600" }}>Scan summary (for LLM)</Text>
-                        <Text style={{ fontFamily: "Courier", fontSize: 12, borderWidth: 1, borderRadius: 8, padding: 10 }}>
-                            {scanSummary}
-                        </Text>
-                    </View>
-                ) : null}
 
                 {assistantText ? (
                     <View style={{ marginTop: 8 }}>
-                        <Text style={{ fontSize: 14, fontWeight: "600" }}>LLM raw output</Text>
+                        <Text style={{ fontSize: 14, fontWeight: "600" }}>Assistant output</Text>
                         <Text style={{ fontFamily: "Courier", fontSize: 12, borderWidth: 1, borderRadius: 8, padding: 10 }}>
                             {assistantText}
                         </Text>
@@ -852,7 +606,7 @@ export default function App() {
                 ) : null}
 
                 {pendingAction ? (
-                    <View style={{ marginTop: 8 }}>
+                    <View style={{ marginTop: 6 }}>
                         <Text style={{ fontSize: 14, fontWeight: "600" }}>Parsed action</Text>
                         <Text style={{ fontFamily: "Courier", fontSize: 12, borderWidth: 1, borderRadius: 8, padding: 10 }}>
                             {JSON.stringify(pendingAction, null, 2)}
@@ -860,18 +614,80 @@ export default function App() {
                     </View>
                 ) : null}
 
+                <View style={{ height: 14 }} />
+                <Text style={{ fontSize: 16, fontWeight: "600" }}>Auto Flower Scanner (no human selection)</Text>
+
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                    <Text style={{ fontSize: 14 }}>DEV: treat all images as flowers</Text>
+                    <Switch value={DEV_TREAT_ALL_AS_FLOWERS} onValueChange={setDevTreatAllAsFlowers} />
+                </View>
+
+                <Text style={{ fontSize: 12, color: "gray" }}>maxToScan</Text>
+                <TextInput
+                    value={maxToScan}
+                    onChangeText={setMaxToScan}
+                    keyboardType="number-pad"
+                    style={{ borderWidth: 1, borderRadius: 8, padding: 8 }}
+                />
+
+                <Text style={{ fontSize: 12, color: "gray" }}>maxToUpload</Text>
+                <TextInput
+                    value={maxToUpload}
+                    onChangeText={setMaxToUpload}
+                    keyboardType="number-pad"
+                    style={{ borderWidth: 1, borderRadius: 8, padding: 8 }}
+                />
+
+                <Button
+                    title={scanBusy ? "Scanning… (please wait)" : "Scan camera roll → upload flowers to /shared/"}
+                    onPress={scanAndUploadFlowers}
+                    disabled={!accessToken || scanBusy}
+                />
+
+                <View style={{ height: 14 }} />
+                <Text style={{ fontSize: 16, fontWeight: "600" }}>Tiny-head demo (optional)</Text>
+                <Button title="Save annotation (labels)" onPress={confirmLabel} />
+                <Button title="Train locally (head only)" onPress={trainLocal} />
+                <Button title="Upload delta.npy to Solid" onPress={uploadDelta} disabled={!accessToken} />
+                <Button title="Reset local samples" onPress={resetLocal} />
+
+                <View style={{ height: 8 }} />
+                <Text style={{ fontSize: 12 }}>redirectUri: {redirectUri}</Text>
+                <Text style={{ fontSize: 12 }}>client_id: {clientId || "(none)"}</Text>
+                <Text style={{ fontSize: 12 }}>embedDim: {embedDim ?? "(none)"}</Text>
+
                 <View style={{ height: 10 }} />
+                <Text style={{ fontSize: 16, fontWeight: "600" }}>Predictions</Text>
+                {predTop.length === 0 ? (
+                    <Text style={{ fontSize: 12 }}>(no predictions)</Text>
+                ) : (
+                    predTop.map((t) => (
+                        <Text key={t.label} style={{ fontSize: 12 }}>
+                            {t.label}: {t.p.toFixed(3)}
+                        </Text>
+                    ))
+                )}
+
+                <View style={{ height: 10 }} />
+                <Text style={{ fontSize: 16, fontWeight: "600" }}>Labels</Text>
+                {LABELS.map((lbl, i) => (
+                    <View
+                        key={lbl}
+                        style={{
+                            flexDirection: "row",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            paddingVertical: 4,
+                        }}
+                    >
+                        <Text style={{ fontSize: 14 }}>{lbl}</Text>
+                        <Switch value={labelState[i]} onValueChange={() => toggleLabel(i)} />
+                    </View>
+                ))}
+
+                <View style={{ height: 14 }} />
                 <Text style={{ fontSize: 16, fontWeight: "600" }}>Log</Text>
-                <Text
-                    style={{
-                        borderWidth: 1,
-                        borderRadius: 8,
-                        padding: 10,
-                        minHeight: 220,
-                        fontFamily: "Courier",
-                        fontSize: 12,
-                    }}
-                >
+                <Text style={{ borderWidth: 1, borderRadius: 8, padding: 10, minHeight: 220, fontFamily: "Courier", fontSize: 12 }}>
                     {log || "(no logs yet)"}
                 </Text>
             </ScrollView>
