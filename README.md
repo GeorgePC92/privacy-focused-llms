@@ -153,16 +153,17 @@ You are free to use, modify, and distribute this software, including for commerc
 
 If you use this code in academic work or derivative projects, please cite the associated paper:
 
-> *From Camera Roll to Solid Pod: LLM-Facilitated Privacy-Preserving Data Sharing on Mobile Devices*, Solid Symposium 2026
+> George Popescu-Craiova. *From Camera Roll to Solid Pod: LLM-Facilitated Privacy-Preserving Data Sharing on Mobile Devices.* In 4th Privacy & Personal Data Management Session @ Solid Symposium 2026. [[OpenReview]](https://openreview.net/forum?id=8II8kOoQ46)
 
-@inproceedings{
-popescu-craiova2026from,
-title={From Camera Roll to Solid Pod: {LLM}-Facilitated Privacy-Preserving Data Sharing on Mobile Devices},
-author={George Popescu-Craiova},
-booktitle={4th Privacy {\&} Personal Data Management Session @ Solid Symposium 2026},
-year={2026},
-url={https://openreview.net/forum?id=8II8kOoQ46}
+```bibtex
+@inproceedings{popescu-craiova2026from,
+  title     = {From Camera Roll to Solid Pod: {LLM}-Facilitated Privacy-Preserving Data Sharing on Mobile Devices},
+  author    = {George Popescu-Craiova},
+  booktitle = {4th Privacy {\&} Personal Data Management Session @ Solid Symposium 2026},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=8II8kOoQ46}
 }
+```
 
 
 ---
