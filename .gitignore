@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Model weights (host externally via HuggingFace Hub, GCS, or Git LFS)
+*.pte
+*.tok
+*.bin
+*.gguf
+*.onnx
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Android
+*.keystore
+debug.keystore
+*.apk
+*.aab
+.gradle/
+android/app/build/
+android/build/
+
+# iOS
+ios/Pods/
+*.xcworkspace
+*.xcuserdata
+
+# Expo
+.expo/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
