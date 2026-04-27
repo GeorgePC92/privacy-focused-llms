@@ -155,4 +155,14 @@ If you use this code in academic work or derivative projects, please cite the as
 
 > *From Camera Roll to Solid Pod: LLM-Facilitated Privacy-Preserving Data Sharing on Mobile Devices*, Solid Symposium 2026
 
+@inproceedings{
+popescu-craiova2026from,
+title={From Camera Roll to Solid Pod: {LLM}-Facilitated Privacy-Preserving Data Sharing on Mobile Devices},
+author={George Popescu-Craiova},
+booktitle={4th Privacy {\&} Personal Data Management Session @ Solid Symposium 2026},
+year={2026},
+url={https://openreview.net/forum?id=8II8kOoQ46}
+}
+
+
 ---
